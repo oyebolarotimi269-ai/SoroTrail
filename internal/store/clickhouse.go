@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -16,8 +15,9 @@ import (
 // It is intentionally minimal for now and is wired through the same
 // interface so the app can select it via DATABASE_URL.
 //
-// contributors: Ping performs a real TCP dial to the server so the
-// readiness probe cannot report healthy against an unreachable database.
+// Ping performs a real protocol round-trip over the HTTP interface, not a
+// bare TCP dial: a readiness probe that passes is evidence the server
+// actually answers queries, not just that a TCP socket accepted a dial.
 type ClickHouse struct {
 	host string
 	port int
@@ -1416,16 +1416,24 @@ func (c *ClickHouse) DeleteDeadLetter(ctx context.Context, id int64) error {
 	return nil
 }
 
+// Ping verifies the database is actually serving queries, not merely
+// listening on a socket. It runs SELECT 1 over the same HTTP executor the
+// data methods use, so /readyz fails whenever the server answers anything
+// other than a successful scalar query — a stuck listener, a wrong port
+// that happens to have something bound, or a half-open container all fail
+// the probe instead of passing it. The request carries ctx, so the probe
+// honours the caller's deadline instead of outliving it.
 func (c *ClickHouse) Ping(ctx context.Context) error {
 	if c.host == "" {
 		return fmt.Errorf("clickhouse: not configured (empty host)")
 	}
-	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	one, err := newClickHouseExecutor(c.cfg).queryInt64(ctx, c.cfg.databaseOrDefault(), "SELECT 1")
 	if err != nil {
-		return fmt.Errorf("clickhouse ping %s: %w", addr, err)
+		return fmt.Errorf("clickhouse ping %s:%d: %w", c.host, c.cfg.httpPort, err)
 	}
-	conn.Close()
+	if one != 1 {
+		return fmt.Errorf("clickhouse ping %s:%d: SELECT 1 returned %d", c.host, c.cfg.httpPort, one)
+	}
 	return nil
 }
 
